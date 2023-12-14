@@ -1346,18 +1346,18 @@ class PPOTrainer(BaseTrainer):
                     batch_list = gathered_batch_list
 
                 table_rows = [list(r) for r in zip(*batch_list, rewards.cpu().tolist())]
-                logs.update({"game_log": wandb.Table(columns=[*columns_to_log, "reward"], rows=table_rows)})
+                # logs.update({"game_log": wandb.Table(columns=[*columns_to_log, "reward"], rows=table_rows)})
 
             logs.update(stats)
-
-            logs["env/reward_mean"] = torch.mean(rewards).cpu().item()
-            logs["env/reward_std"] = torch.std(rewards).cpu().item()
-            logs["env/reward_dist"] = rewards.cpu()
 
             # manually cast in fp32 for bf16 torch tensors
             for k, v in logs.items():
                 if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
                     logs[k] = v.float()
+
+            logs["env/reward_mean"] = torch.mean(rewards.type(torch.float)).cpu().numpy().item()
+            logs["env/reward_std"] = torch.std(rewards.type(torch.float)).cpu().numpy().item()
+            logs["env/reward_dist"] = rewards.type(torch.float).cpu().numpy()
 
             if self.config.log_with == "tensorboard":
                 # update the current step
