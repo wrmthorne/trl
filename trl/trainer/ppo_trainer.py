@@ -1370,9 +1370,9 @@ class PPOTrainer(BaseTrainer):
                 if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
                     logs[k] = v.float()
 
-            logs["env/reward_mean"] = torch.mean(rewards).cpu().numpy().item()
-            logs["env/reward_std"] = torch.std(rewards).cpu().numpy().item()
-            logs["env/reward_dist"] = rewards.cpu().numpy()
+            logs["env/reward_mean"] = torch.mean(rewards.float()).cpu().numpy().item()
+            logs["env/reward_std"] = torch.std(rewards.float()).cpu().numpy().item()
+            logs["env/reward_dist"] = rewards.float().cpu().numpy()
 
             if self.config.log_with == "tensorboard":
                 # update the current step
