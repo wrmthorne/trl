@@ -232,8 +232,8 @@ class PPOTrainer(BaseTrainer):
                 )
         elif ref_model is None and not self.is_peft_model:
             self.ref_model = create_reference_model(self.model, num_shared_layers=num_shared_layers)
-        # elif self.is_peft_model:
-        #     self.ref_model = None
+        elif self.is_peft_model:
+            self.ref_model = None
         else:
             raise ValueError(
                 f"ref_model must be a PreTrainedModelWrapper or `None`, got {type(ref_model)} - supported "
@@ -716,21 +716,14 @@ class PPOTrainer(BaseTrainer):
                 response_masks=response_masks,
                 return_logits=full_kl_penalty,
             )
-            ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
-                self.ref_model,
-                queries,
-                responses,
-                model_inputs,
-                return_logits=full_kl_penalty,
-            )
-            # with self.optional_peft_ctx():
-            #     ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
-            #         self.model if self.is_peft_model else self.ref_model,
-            #         queries,
-            #         responses,
-            #         model_inputs,
-            #         return_logits=full_kl_penalty,
-            #     )
+            with self.optional_peft_ctx():
+                ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
+                    self.model if self.is_peft_model else self.ref_model,
+                    queries,
+                    responses,
+                    model_inputs,
+                    return_logits=full_kl_penalty,
+                )
 
         timing["time/ppo/forward_pass"] = time.time() - t
 
