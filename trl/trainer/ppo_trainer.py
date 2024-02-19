@@ -234,6 +234,7 @@ class PPOTrainer(BaseTrainer):
             self.ref_model = create_reference_model(self.model, num_shared_layers=num_shared_layers)
         elif self.is_peft_model:
             self.ref_model = None
+            self.model.create_reference_adapter()
         else:
             raise ValueError(
                 f"ref_model must be a PreTrainedModelWrapper or `None`, got {type(ref_model)} - supported "
@@ -459,7 +460,12 @@ class PPOTrainer(BaseTrainer):
             `torch.LongTensor`: A tensor of shape (`batch_size`, `gen_len`) containing response tokens.
         """
         if generate_ref_response:
-            ref_model = self.model if self.is_peft_model else self.ref_model
+            if self.is_peft_model:
+                active_adapter = self.accelerator.unwrap_model(self.model).pretrained_model.active_adapter
+                self.accelerator.unwrap_model(self.model).set_adapter('reference')
+                ref_model = self.model
+            else:
+                ref_model = self.ref_model
         if isinstance(query_tensor, List):
             response = self._generate_batched(
                 self.model,
@@ -470,15 +476,14 @@ class PPOTrainer(BaseTrainer):
                 **generation_kwargs,
             )
             if generate_ref_response:
-                with self.optional_peft_ctx():
-                    ref_response = self._generate_batched(
-                        ref_model,
-                        query_tensor,
-                        length_sampler=length_sampler,
-                        batch_size=batch_size,
-                        return_prompt=return_prompt,
-                        **generation_kwargs,
-                    )
+                ref_response = self._generate_batched(
+                    ref_model,
+                    query_tensor,
+                    length_sampler=length_sampler,
+                    batch_size=batch_size,
+                    return_prompt=return_prompt,
+                    **generation_kwargs,
+                )
 
         else:
             if len(query_tensor.shape) == 2:
@@ -492,8 +497,7 @@ class PPOTrainer(BaseTrainer):
                 input_ids=query_tensor.unsqueeze(dim=0), **generation_kwargs
             )
             if generate_ref_response:
-                with self.optional_peft_ctx():
-                    ref_response = ref_model.generate(input_ids=query_tensor.unsqueeze(dim=0), **generation_kwargs)
+                ref_response = ref_model.generate(input_ids=query_tensor.unsqueeze(dim=0), **generation_kwargs)
 
             if not return_prompt and not self.is_encoder_decoder:
                 response = response[:, query_tensor.shape[0] :]
@@ -501,6 +505,9 @@ class PPOTrainer(BaseTrainer):
                     ref_response = ref_response[:, query_tensor.shape[0] :]
 
         if generate_ref_response:
+            if self.is_peft_model:
+                self.accelerator.unwrap_model(self.model).pretrained_model.set_adapter(active_adapter)
+            
             return response, ref_response
         return response
 
@@ -716,14 +723,24 @@ class PPOTrainer(BaseTrainer):
                 response_masks=response_masks,
                 return_logits=full_kl_penalty,
             )
-            with self.optional_peft_ctx():
-                ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
-                    self.model if self.is_peft_model else self.ref_model,
-                    queries,
-                    responses,
-                    model_inputs,
-                    return_logits=full_kl_penalty,
-                )
+
+            if self.is_peft_model:
+                active_adapter = self.accelerator.unwrap_model(self.model).pretrained_model.active_adapter
+                self.accelerator.unwrap_model(self.model).pretrained_model.set_adapter('reference')
+                ref_model = self.model
+            else:
+                ref_model = self.ref_model
+
+            ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
+                ref_model,
+                queries,
+                responses,
+                model_inputs,
+                return_logits=full_kl_penalty,
+            )
+
+            if self.is_peft_model:
+                self.accelerator.unwrap_model(self.model).pretrained_model.set_adapter(active_adapter)
 
         timing["time/ppo/forward_pass"] = time.time() - t
 

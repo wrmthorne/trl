@@ -42,6 +42,8 @@ if is_peft_available():
         PromptLearningConfig,
         get_peft_model,
         prepare_model_for_kbit_training,
+        get_peft_model_state_dict,
+        set_peft_model_state_dict,
     )
 
 if is_transformers_greater_than("4.33.0"):
@@ -598,6 +600,21 @@ class PreTrainedModelWrapper(nn.Module):
         self.pretrained_model.eval()
 
         return scores
+    
+    def create_reference_adapter(self):
+        policy_state_dict = get_peft_model_state_dict(
+            self.pretrained_model,
+            adapter_name=self.policy_adapter_name
+        )
+        policy_config = self.pretrained_model.peft_config[self.policy_adapter_name]
+        policy_config.inference_mode = True
+
+        self.pretrained_model.add_adapter('reference', policy_config)
+        set_peft_model_state_dict(
+            self.pretrained_model,
+            policy_state_dict,
+            adapter_name='reference'
+        )
 
 
 def create_reference_model(
