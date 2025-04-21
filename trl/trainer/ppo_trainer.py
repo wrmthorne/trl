@@ -60,6 +60,7 @@ from .utils import (
     generate_model_card,
     get_comet_experiment_url,
     get_reward,
+    is_seq2seq_model,
     log_table_to_comet_experiment,
     peft_module_casting_to_bf16,
     prepare_deepspeed,
@@ -87,10 +88,29 @@ class PolicyAndValueWrapper(nn.Module):
         self.policy = policy
         self.value_model = value_model
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
+        self.is_encoder_decoder = is_seq2seq_model(policy)
 
     def forward(self, **kwargs):
-        output = self.critic_backbone(**kwargs)
-        logits = self.value_model.score(output.hidden_states[-1])
+        output = None
+        
+        if self.is_encoder_decoder:
+            # For encoder-decoder models, we need special handling
+            # Either use both encoder and decoder or just the encoder depending on the inputs
+            if "decoder_input_ids" in kwargs:
+                # Full encoder-decoder forward pass
+                output = self.critic_backbone(**kwargs)
+                logits = self.value_model.score(output.decoder_hidden_states[-1])
+            else:
+                # Encoder-only pass (for initial processing)
+                output = self.critic_backbone.encoder(**{k: v for k, v in kwargs.items() 
+                                                        if not k.startswith("decoder_")})
+                # No scoring here since we need decoder outputs for that
+                logits = None
+        else:
+            # Original causal model implementation
+            output = self.critic_backbone(**kwargs)
+            logits = self.value_model.score(output.hidden_states[-1])
+            
         return self.policy(**kwargs), logits
 
 
@@ -124,6 +144,7 @@ class PPOTrainer(Trainer):
         self.args = args
         self.processing_class = processing_class
         self.policy_model = model
+        self.is_encoder_decoder = is_seq2seq_model(model)
 
         # Define the collator if not provided
         if data_collator is None:
@@ -352,6 +373,7 @@ class PPOTrainer(Trainer):
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
+        is_encoder_decoder = self.is_encoder_decoder
 
         def repeat_generator():
             while True:
@@ -419,6 +441,7 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
+                
                 with unwrap_model_for_generation(
                     self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
@@ -433,18 +456,36 @@ class PPOTrainer(Trainer):
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
-                    response = query_response[:, context_length:]
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    
+                    if is_encoder_decoder:
+                        # For encoder-decoder models, the response is the entire generated sequence
+                        response = query_response
+                        # Logits are already aligned for encoder-decoder models
+                        logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    else:
+                        # For causal models, extract only the generated part
+                        response = query_response[:, context_length:]
+                        logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    
+                    # Calculate log probabilities
                     logprob = selective_log_softmax(logits, response)
                     del logits
                     torch.cuda.empty_cache()
 
+                    # Reference model forward pass
                     if ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
-                    ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                        
+                    if is_encoder_decoder:
+                        # For encoder-decoder models, use the decoder logits
+                        ref_logits = ref_output.logits
+                    else:
+                        # For causal models, offset and get relevant part
+                        ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                        
                     ref_logits /= args.temperature + 1e-7
                     ref_logprob = selective_log_softmax(ref_logits, response)
                     del ref_output, ref_logits
@@ -458,15 +499,30 @@ class PPOTrainer(Trainer):
                         )
 
                     # Response Processing 2. run reward model on the truncated responses
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    if is_encoder_decoder:
+                        # For encoder-decoder models, the full response is the generated sequence
+                        postprocessed_query_response = postprocessed_response
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    else:
+                        # For causal models, concatenate query and response
+                        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1 + context_length
+                    
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    
+                    if is_encoder_decoder:
+                        # For encoder-decoder models, value is calculated on all tokens
+                        value = full_value.squeeze(-1)
+                    else:
+                        # For causal models, extract values for generated tokens
+                        value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    
                     _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        reward_model, postprocessed_query_response, processing_class.pad_token_id, 
+                        0 if is_encoder_decoder else context_length  # For encoder-decoder, the context is the entire input
                     )
 
                     responses.append(response)
@@ -476,6 +532,7 @@ class PPOTrainer(Trainer):
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
+                    
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -553,13 +610,27 @@ class PPOTrainer(Trainer):
                             mb_values = values[micro_batch_inds]
 
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
-                            logits = output.logits[:, context_length - 1 : -1]
+                            
+                            if is_encoder_decoder:
+                                # For encoder-decoder models, logits come directly from decoder output
+                                logits = output.logits
+                            else:
+                                # For causal models, shift and extract relevant logits
+                                logits = output.logits[:, context_length - 1 : -1]
+                                
                             logits /= args.temperature + 1e-7
                             new_logprobs = selective_log_softmax(logits, mb_responses)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
-                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                            
+                            if is_encoder_decoder:
+                                # For encoder-decoder models, vpred comes directly from value model output
+                                vpred = vpred_temp.squeeze(-1)
+                            else:
+                                # For causal models, shift and extract relevant values
+                                vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                                
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
                             vpredclipped = torch.clamp(
                                 vpred,
@@ -685,6 +756,7 @@ class PPOTrainer(Trainer):
     def generate_completions(self, sampling: bool = False):
         args = self.args
         processing_class = self.processing_class
+        is_encoder_decoder = self.is_encoder_decoder
         generation_config = GenerationConfig(
             max_new_tokens=self.args.response_length,
             temperature=(0.01 + 1e-7),
@@ -708,23 +780,44 @@ class PPOTrainer(Trainer):
                         processing_class.pad_token_id,
                         generation_config,
                     )
-                    response = query_response[:, context_length:]
+                    
+                    if is_encoder_decoder:
+                        # For encoder-decoder models, response is the entire generated sequence
+                        response = query_response
+                        # Decode input separately to show in table
+                        table["query"].extend(
+                            gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
+                        )
+                    else:
+                        # For causal models, extract only the generated part
+                        response = query_response[:, context_length:]
+                        table["query"].extend(
+                            gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
+                        )
+                    
                     postprocessed_response = response
                     if self.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             self.stop_token_id, processing_class.pad_token_id, response
                         )
-                    table["query"].extend(
-                        gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
-                    )
+                    
                     table["model response"].extend(
                         gather_object(processing_class.batch_decode(postprocessed_response))
                     )
 
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                    )
+                    if is_encoder_decoder:
+                        # For encoder-decoder models, the reward is calculated on the generated sequence alone
+                        postprocessed_query_response = postprocessed_response
+                        _, score, _ = get_reward(
+                            self.reward_model, postprocessed_query_response, processing_class.pad_token_id, 0
+                        )
+                    else:
+                        # For causal models, concatenate query and response
+                        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                        _, score, _ = get_reward(
+                            self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        )
+                        
                     table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 
                 if sampling:
@@ -776,6 +869,10 @@ class PPOTrainer(Trainer):
 
         if hasattr(self.model.config, "unsloth_version"):
             tags.append("unsloth")
+            
+        # Add tag for encoder-decoder models
+        if self.is_encoder_decoder:
+            tags.append("encoder-decoder")
 
         citation = textwrap.dedent("""\
         @article{mziegler2019fine-tuning,
