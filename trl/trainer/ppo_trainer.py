@@ -486,7 +486,11 @@ class PPOTrainer(Trainer):
 
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    if is_encoder_decoder:
+                        # Skip first token (decoder_start_token_id usually same as pad_token_id) or len always -1
+                        sequence_length = first_true_indices(postprocessed_response[:, 1:] == processing_class.pad_token_id)
+                    else:
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
