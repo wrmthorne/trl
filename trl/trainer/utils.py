@@ -1205,11 +1205,11 @@ def get_reward(
             attention_mask=attention_mask,
             return_dict=True,
         )
-        reward_logits = output.logits    # Shape: (batch_size, 1)
+        reward_logits = output.logits
         
         return (
-            reward_logits.unsqueeze(-1), # Make shape (batch_size, 1, 1) to match expected format
-            reward_logits.squeeze(-1),   # Shape (batch_size,) for scalar rewards
+            reward_logits.unsqueeze(-1),
+            reward_logits.squeeze(-1),
             sequence_lengths,
         )
     else:
@@ -1476,8 +1476,9 @@ def batch_generation(
                 output_scores=True,
             )
             
-            # For encoder-decoder, output.sequences already contains just the generated part
-            query_response = output.sequences
+            # We will consistently remove first special token for seq2seq generations
+            # to keep the logits and responses aligned
+            query_response = output.sequences[:, 1:]
             logits = torch.stack(output.scores, 1)
         else:
             # For causal models, use the existing generate function
@@ -1840,9 +1841,6 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    # For seq2seq models, trim the index tensor to match logits length
-    index = index[:, -logits.size(1):]
-    
     if logits.dtype in (torch.float32, torch.float64):
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption

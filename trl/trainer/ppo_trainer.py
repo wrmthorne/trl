@@ -461,7 +461,7 @@ class PPOTrainer(Trainer):
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     
                     if is_encoder_decoder:
-                        response = query_response[:, 1:]
+                        response = query_response
                         query_response = torch.cat((query, response), 1) # Reconstruct sequence
                     else:
                         response = query_response[:, context_length:] # Extract only the generated part
@@ -479,7 +479,6 @@ class PPOTrainer(Trainer):
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id, context_length)
                         
                     if is_encoder_decoder:
-                        # Remove last last logit to align with policy logits
                         ref_logits = ref_output.logits
                     else:
                         # For causal models, offset and get relevant part
@@ -550,8 +549,6 @@ class PPOTrainer(Trainer):
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                # responses.shape[1] == logprobs.shape[1] for causal => No change in causal behaviour
-                # responses.shape[1] == logprobs.shape[1] + 1 for seq2seq => easily realign everything
                 response_idxs = torch.arange(logprobs.shape[1], device=responses.device).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
