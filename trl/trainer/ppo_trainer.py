@@ -443,7 +443,6 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                
                 with unwrap_model_for_generation(
                     self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
@@ -459,33 +458,29 @@ class PPOTrainer(Trainer):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
-                    
+
                     if is_encoder_decoder:
                         response = query_response
                         query_response = torch.cat((query, response), 1) # Reconstruct sequence
                     else:
                         response = query_response[:, context_length:] # Extract only the generated part
                     
-                    # Calculate log probabilities
-                    logprob = selective_log_softmax(logits, response)
+                    # Logits ignore BOS and response > logits causing index error
+                    logprob = selective_log_softmax(logits, response[:, 1:] if is_encoder_decoder else response)
                     del logits
                     torch.cuda.empty_cache()
 
-                    # Reference model forward pass
                     if ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id, context_length)
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id, context_length)
-                        
                     if is_encoder_decoder:
-                        ref_logits = ref_output.logits
+                        ref_logits = ref_output.logits[:, 1:] # Ignore BOS same as logits
                     else:
-                        # For causal models, offset and get relevant part
                         ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                        
                     ref_logits /= args.temperature + 1e-7
-                    ref_logprob = selective_log_softmax(ref_logits, response)
+                    ref_logprob = selective_log_softmax(ref_logits, response[:, 1:] if is_encoder_decoder else response)
                     del ref_output, ref_logits
                     torch.cuda.empty_cache()
 
@@ -497,27 +492,17 @@ class PPOTrainer(Trainer):
                         )
 
                     # Response Processing 2. run reward model on the truncated responses
-                    if is_encoder_decoder:
-                        # For encoder-decoder models, the full response is the generated sequence
-                        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-                    else:
-                        # For causal models, concatenate query and response
-                        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-
+                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    # sequence_length -= int(is_encoder_decoder) # TODO: Find whether subtracting 1 here does anything
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    
                     if is_encoder_decoder:
-                        # For encoder-decoder models, value is calculated on all tokens
                         value = full_value.squeeze(-1)
                     else:
-                        # For causal models, extract values for generated tokens
                         value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    
                     _, score, _ = get_reward(
                         reward_model, postprocessed_query_response, processing_class.pad_token_id, 
                         0 if is_encoder_decoder else context_length  # For encoder-decoder, the context is the entire input
@@ -527,10 +512,9 @@ class PPOTrainer(Trainer):
                     postprocessed_responses.append(postprocessed_response)
                     logprobs.append(logprob)
                     ref_logprobs.append(ref_logprob)
-                    sequence_lengths.append(sequence_length)
+                    sequence_lengths.append(sequence_length - int(is_encoder_decoder))
                     scores.append(score)
                     values.append(value)
-                    
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -547,10 +531,12 @@ class PPOTrainer(Trainer):
                 contain_eos_token = torch.any(postprocessed_responses == self.processing_class.eos_token_id, dim=-1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
+                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
+                # Subtract 1 from seq-lens if seq2seq because teacher forcing shifts logits
                 response_idxs = torch.arange(logprobs.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
+                padding_mask = response_idxs > (sequence_lengths.unsqueeze(1) - int(is_encoder_decoder))
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
                 sequence_lengths_p1 = sequence_lengths + 1
@@ -575,7 +561,7 @@ class PPOTrainer(Trainer):
                 # 6. compute advantages and returns
                 lastgaelam = 0
                 advantages_reversed = []
-                gen_length = responses.shape[1]
+                gen_length = values.shape[1]
                 for t in reversed(range(gen_length)):
                     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
@@ -609,14 +595,12 @@ class PPOTrainer(Trainer):
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
                             
                             if is_encoder_decoder:
-                                # For encoder-decoder models, logits come directly from decoder output
-                                logits = output.logits
+                                logits = output.logits[:, 1:]
                             else:
-                                # For causal models, shift and extract relevant logits
                                 logits = output.logits[:, context_length - 1 : -1]
                                 
                             logits /= args.temperature + 1e-7
-                            new_logprobs = selective_log_softmax(logits, mb_responses)
+                            new_logprobs = selective_log_softmax(logits, mb_responses[:, 1:] if is_encoder_decoder else mb_responses)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )

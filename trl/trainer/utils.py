@@ -1476,9 +1476,7 @@ def batch_generation(
                 output_scores=True,
             )
             
-            # We will consistently remove first special token for seq2seq generations
-            # to keep the logits and responses aligned
-            query_response = output.sequences[:, 1:]
+            query_response = output.sequences
             logits = torch.stack(output.scores, 1)
         else:
             # For causal models, use the existing generate function
