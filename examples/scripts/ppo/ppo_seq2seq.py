@@ -94,10 +94,10 @@ if __name__ == "__main__":
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1, problem_type="regression"
     )
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1, problem_type="regression"
     )
     policy = AutoModelForSeq2SeqLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code

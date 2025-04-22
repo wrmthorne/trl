@@ -1194,10 +1194,12 @@ def get_reward(
                 The lengths of the sequences in the query responses.
     """
     # TODO: Add check for model.config.problem_type == "regression" if is_encoder_decoder
+    # TODO: Properly test this method
     attention_mask = query_responses != pad_token_id
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
     
     if is_seq2seq_model(model):
+        query_responses = truncate_response(model.config.eos_token_id, pad_token_id, query_responses)
         # Seq2SeqForSequenceClassification forward pass performs logit handling for us
         # https://github.com/huggingface/transformers/blob/a42ba80fa520c784c8f11a973ca9034e5f859b79/src/transformers/models/t5/modeling_t5.py#L2135
         output = model(
@@ -1206,7 +1208,6 @@ def get_reward(
             return_dict=True,
         )
         reward_logits = output.logits
-        
         return (
             reward_logits.unsqueeze(-1),
             reward_logits.squeeze(-1),
@@ -1265,6 +1266,9 @@ def forward(
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     
     if is_seq2seq_model(model):
+        # Decoder logits are conditioned on encoder input. Previous implementation
+        # treated everything as a decoder input - Possible reason for KL divergence
+        # issues
         encoder_input_ids = input_ids[:, :context_length]
         encoder_attention_mask = attention_mask[:, :context_length]
         decoder_input_ids = input_ids[:, context_length:]
@@ -1396,35 +1400,25 @@ def generate(
     context_length = queries.shape[1]
     attention_mask = queries != pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
-    
+    output = lm_backbone.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # not needed: already adjusted in generations
+        # https://github.com/huggingface/transformers/blob/ac33aeeeee2a7a89b89c93c2962e6feb90daef0a/src/transformers/models/gpt2/modeling_gpt2.py#L1227-L1250
+        generation_config=generation_config,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+    logits = torch.stack(output.scores, 1)
     if is_seq2seq_model(lm_backbone):
-        # For encoder-decoder models, the entire input is used as encoder input
-        # and generation happens independently in the decoder
-        output = lm_backbone.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            generation_config=generation_config,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-        logits = torch.stack(output.scores, 1)
-        # For encoder-decoder models, we don't concatenate with the input
-        # as the generated sequence is already complete
-        return output.sequences, logits
+        # Pad start align tokens and right shifted logits from teacher forcing
+        first_token_logits = torch.zeros(
+            (logits.shape[0], 1, logits.shape[2]), 
+            dtype=logits.dtype, device=logits.device)
+        return torch.cat((queries, output.sequences), dim=1), torch.cat((first_token_logits, logits), dim=1)
     else:
-        # Original implementation for causal models
-        output = lm_backbone.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # not needed: already adjusted in generations
-            # https://github.com/huggingface/transformers/blob/ac33aeeeee2a7a89b89c93c2962e6feb90daef0a/src/transformers/models/gpt2/modeling_gpt2.py#L1227-L1250
-            generation_config=generation_config,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-        logits = torch.stack(output.scores, 1)
         return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
-        
+
 @torch.no_grad()
 def batch_generation(
     model: torch.nn.Module,
@@ -1458,39 +1452,18 @@ def batch_generation(
     query_responses = []
     logitss = []
     batch_size = queries.shape[0]
-    is_encoder_decoder = is_seq2seq_model(model)
-    
     for i in range(0, batch_size, local_rollout_forward_batch_size):
         query = queries[i : i + local_rollout_forward_batch_size]
-        
-        if is_encoder_decoder:
-
-            attention_mask = query != pad_token_id
-            input_ids = torch.masked_fill(query, ~attention_mask, 0)
-            
-            output = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-            
-            query_response = output.sequences
-            logits = torch.stack(output.scores, 1)
-        else:
-            # For causal models, use the existing generate function
-            query_response, logits = generate(
-                model,
-                query,
-                pad_token_id,
-                generation_config,
-            )
-        
+        query_response, logits = generate(
+            model,
+            query,
+            pad_token_id,
+            generation_config,
+        )
         query_responses.append(query_response)
         logitss.append(logits)
 
-    # Padding tensors - for both model types
+    # padding tensors
     padded_query_responses = pad(query_responses, padding_value=pad_token_id, padding_side="right")
     padded_logitss = pad(logitss, padding_value=0, padding_side="right")
 
