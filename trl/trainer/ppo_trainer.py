@@ -95,17 +95,19 @@ class PolicyAndValueWrapper(nn.Module):
         
         if self.is_encoder_decoder:
             # For encoder-decoder models, we need special handling
-            # Either use both encoder and decoder or just the encoder depending on the inputs
             if "decoder_input_ids" in kwargs:
                 # Full encoder-decoder forward pass
-                output = self.critic_backbone(**kwargs)
-                logits = self.value_model.score(output.decoder_hidden_states[-1])
-            else:
-                # Encoder-only pass (for initial processing)
-                output = self.critic_backbone.encoder(**{k: v for k, v in kwargs.items() 
-                                                        if not k.startswith("decoder_")})
-                # No scoring here since we need decoder outputs for that
-                logits = None
+                output = self.critic_backbone(
+                    input_ids=kwargs["input_ids"],
+                    attention_mask=kwargs["attention_mask"],
+                    decoder_input_ids=kwargs["decoder_input_ids"],
+                    decoder_attention_mask=kwargs["decoder_attention_mask"],
+                    return_dict=True,
+                    output_hidden_states=True,
+                )
+                # For encoder-decoder models, we use the decoder's last hidden state
+                # and pass it through the value model's classification head
+                logits = self.value_model.classification_head(output.decoder_hidden_states[-1])
         else:
             # Original causal model implementation
             output = self.critic_backbone(**kwargs)
@@ -456,16 +458,13 @@ class PPOTrainer(Trainer):
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
+                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     
                     if is_encoder_decoder:
-                        # For encoder-decoder models, the response is the entire generated sequence
-                        response = query_response
-                        # Logits are already aligned for encoder-decoder models
-                        logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                        response = query_response[:, 1:]
+                        query_response = torch.cat((query, response), 1) # Reconstruct sequence
                     else:
-                        # For causal models, extract only the generated part
-                        response = query_response[:, context_length:]
-                        logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                        response = query_response[:, context_length:] # Extract only the generated part
                     
                     # Calculate log probabilities
                     logprob = selective_log_softmax(logits, response)
@@ -475,12 +474,12 @@ class PPOTrainer(Trainer):
                     # Reference model forward pass
                     if ref_policy is None:
                         with self.null_ref_context():
-                            ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
+                            ref_output = forward(model.policy, query_response, processing_class.pad_token_id, context_length)
                     else:
-                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id, context_length)
                         
                     if is_encoder_decoder:
-                        # For encoder-decoder models, use the decoder logits
+                        # Remove last last logit to align with policy logits
                         ref_logits = ref_output.logits
                     else:
                         # For causal models, offset and get relevant part
@@ -501,13 +500,13 @@ class PPOTrainer(Trainer):
                     # Response Processing 2. run reward model on the truncated responses
                     if is_encoder_decoder:
                         # For encoder-decoder models, the full response is the generated sequence
-                        postprocessed_query_response = postprocessed_response
+                        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                         sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     else:
                         # For causal models, concatenate query and response
                         postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1 + context_length
-                    
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
@@ -549,10 +548,11 @@ class PPOTrainer(Trainer):
                 contain_eos_token = torch.any(postprocessed_responses == self.processing_class.eos_token_id, dim=-1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
+                # responses.shape[1] == logprobs.shape[1] for causal => No change in causal behaviour
+                # responses.shape[1] == logprobs.shape[1] + 1 for seq2seq => easily realign everything
+                response_idxs = torch.arange(logprobs.shape[1], device=responses.device).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)

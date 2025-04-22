@@ -1193,33 +1193,25 @@ def get_reward(
             - `sequence_lengths` (`torch.Tensor`):
                 The lengths of the sequences in the query responses.
     """
+    # TODO: Add check for model.config.problem_type == "regression" if is_encoder_decoder
     attention_mask = query_responses != pad_token_id
+    sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
     
-    # Check if model is a Seq2Seq model
-    is_encoder_decoder = is_seq2seq_model(model)
-    
-    if is_encoder_decoder:
-        # For encoder-decoder models, split inputs for encoder and decoder
-        encoder_input_ids = torch.masked_fill(query_responses[:, :context_length], 
-                                             ~attention_mask[:, :context_length], 0)
-        encoder_attention_mask = attention_mask[:, :context_length]
-        
-        decoder_input_ids = torch.masked_fill(query_responses[:, context_length:], 
-                                             ~attention_mask[:, context_length:], 0)
-        decoder_attention_mask = attention_mask[:, context_length:]
-        
-        lm_backbone = getattr(model, model.base_model_prefix)
-        output = lm_backbone(
-            input_ids=encoder_input_ids,
-            attention_mask=encoder_attention_mask,
-            decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
+    if is_seq2seq_model(model):
+        # Seq2SeqForSequenceClassification forward pass performs logit handling for us
+        # https://github.com/huggingface/transformers/blob/a42ba80fa520c784c8f11a973ca9034e5f859b79/src/transformers/models/t5/modeling_t5.py#L2135
+        output = model(
+            input_ids=query_responses,
+            attention_mask=attention_mask,
             return_dict=True,
-            output_hidden_states=True,
         )
+        reward_logits = output.logits    # Shape: (batch_size, 1)
         
-        # Use decoder hidden states for reward calculation in encoder-decoder models
-        reward_logits = model.score(output.decoder_hidden_states[-1])
+        return (
+            reward_logits.unsqueeze(-1), # Make shape (batch_size, 1, 1) to match expected format
+            reward_logits.squeeze(-1),   # Shape (batch_size,) for scalar rewards
+            sequence_lengths,
+        )
     else:
         # Original implementation for causal models
         position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
@@ -1234,30 +1226,22 @@ def get_reward(
             use_cache=False,  # otherwise mistral-based RM would error out
         )
         reward_logits = model.score(output.hidden_states[-1])
-        
-    # For both model types, calculate sequence lengths and final rewards
-    if is_encoder_decoder:
-        # For encoder-decoder models, sequence lengths are based on decoder outputs
-        sequence_lengths = first_true_indices(decoder_input_ids == pad_token_id)
-    else:
-        # For causal models, sequence lengths are based on response part
-        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-    
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[
-            torch.arange(reward_logits.size(0), device=reward_logits.device),
+        # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
+        return (
+            reward_logits,
+            reward_logits[
+                torch.arange(reward_logits.size(0), device=reward_logits.device),
+                sequence_lengths,
+            ].squeeze(-1),
             sequence_lengths,
-        ].squeeze(-1),
-        sequence_lengths,
-    )
+        )
 
 
 def forward(
     model: torch.nn.Module,
     query_responses: torch.Tensor,
     pad_token_id: int,
+    context_length: Optional[int] = None,
 ) -> torch.nn.Module:
     """
     Performs a forward pass through the model with the given query responses and pad token ID.
@@ -1270,30 +1254,32 @@ def forward(
             The tensor containing the query responses.
         pad_token_id (`int`):
             The token ID representing the pad token.
+        context_length (`int`):
+            Length of queries for encoder-decoder models to split at.
 
     Returns:
         `torch.nn.Module`:
             The output of the model, including hidden states.
     """
     attention_mask = query_responses != pad_token_id
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     
-    # Check if model is a Seq2Seq model
-    is_encoder_decoder = is_seq2seq_model(model)
-    
-    if is_encoder_decoder:
-        # For encoder-decoder models, we need to handle the inputs differently
-        input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    if is_seq2seq_model(model):
+        encoder_input_ids = input_ids[:, :context_length]
+        encoder_attention_mask = attention_mask[:, :context_length]
+        decoder_input_ids = input_ids[:, context_length:]
+        decoder_attention_mask = attention_mask[:, context_length:]
         
         return model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=encoder_input_ids,
+            attention_mask=encoder_attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
             return_dict=True,
             output_hidden_states=True,
         )
     else:
-        # Original implementation for causal models
         position_ids = attention_mask.cumsum(1) - attention_mask.long()
-        input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
         return model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1301,6 +1287,83 @@ def forward(
             return_dict=True,
             output_hidden_states=True,
         )
+
+
+def prepare_deepspeed(
+    model: torch.nn.Module, per_device_train_batch_size: int, fp16: bool = False, bf16: bool = False
+):
+    """
+    Prepares the model for training with DeepSpeed (both for stage 2 and 3), configuring the appropriate settings based on the model and
+    batch size.
+
+    Args:
+        model (`torch.nn.Module`):
+            The model to be prepared for DeepSpeed training.
+        per_device_train_batch_size (`int`):
+            The training batch size per device.
+
+    Returns:
+        `torch.nn.Module`:
+            The model initialized and configured with DeepSpeed for training.
+    """
+    import deepspeed
+
+    deepspeed_plugin = AcceleratorState().deepspeed_plugin
+    config_kwargs = deepspeed_plugin.deepspeed_config
+    if config_kwargs["zero_optimization"]["stage"] != 3:
+        config_kwargs["train_micro_batch_size_per_gpu"] = per_device_train_batch_size
+        config_kwargs = {
+            "train_micro_batch_size_per_gpu": config_kwargs["train_micro_batch_size_per_gpu"],
+            "prescale_gradients": False,
+            "wall_clock_breakdown": False,
+        }
+        if bf16:
+            config_kwargs["bf16"] = {"enabled": True}
+        elif fp16:
+            config_kwargs["fp16"] = {"enabled": True}
+    else:
+        if hasattr(model, "config"):
+            hidden_size = (
+                max(model.config.hidden_sizes)
+                if getattr(model.config, "hidden_sizes", None)
+                else getattr(model.config, "hidden_size", None)
+            )
+            if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
+                # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
+                # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
+                config_kwargs.update(
+                    {
+                        "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                        "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                        "zero_optimization.stage3_prefetch_bucket_size": 0,
+                    }
+                )
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+    model.eval()
+    return model
+
+
+def truncate_response(stop_token_id: int, pad_token_id: int, responses: torch.Tensor):
+    """
+    Truncates the responses at the first occurrence of the stop token, filling the rest with pad tokens.
+
+    Args:
+        stop_token_id (`int`):
+            The token ID representing the stop token where truncation occurs.
+        pad_token_id (`int`):
+            The token ID representing the pad token used to fill the truncated responses.
+        responses (`torch.Tensor`):
+            The tensor containing the responses to be truncated.
+
+    Returns:
+        `torch.Tensor`:
+            The truncated responses tensor with pad tokens filled after the stop token.
+    """
+    trunc_idxs = first_true_indices(responses == stop_token_id).unsqueeze(-1)
+    new_size = [1] * (len(responses.size()) - 1) + [responses.shape[1]]
+    idxs = torch.arange(responses.shape[1], device=responses.device).view(*new_size)
+    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, pad_token_id)
+    return postprocessed_responses
 
 
 def generate(
@@ -1334,10 +1397,7 @@ def generate(
     attention_mask = queries != pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
     
-    # Check if model is a Seq2Seq model
-    is_encoder_decoder = is_seq2seq_model(lm_backbone)
-    
-    if is_encoder_decoder:
+    if is_seq2seq_model(lm_backbone):
         # For encoder-decoder models, the entire input is used as encoder input
         # and generation happens independently in the decoder
         output = lm_backbone.generate(
@@ -1398,17 +1458,13 @@ def batch_generation(
     query_responses = []
     logitss = []
     batch_size = queries.shape[0]
-    
-    # Check if model is a Seq2Seq model
     is_encoder_decoder = is_seq2seq_model(model)
     
     for i in range(0, batch_size, local_rollout_forward_batch_size):
         query = queries[i : i + local_rollout_forward_batch_size]
         
         if is_encoder_decoder:
-            # For encoder-decoder models, the encoder processes the entire input
-            # and the decoder generates the output separately
-            context_length = query.shape[1]  # Keep track of input length for later
+
             attention_mask = query != pad_token_id
             input_ids = torch.masked_fill(query, ~attention_mask, 0)
             
@@ -1784,7 +1840,10 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    if logits.dtype in [torch.float32, torch.float64]:
+    # For seq2seq models, trim the index tensor to match logits length
+    index = index[:, -logits.size(1):]
+    
+    if logits.dtype in (torch.float32, torch.float64):
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
