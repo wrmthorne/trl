@@ -457,8 +457,8 @@ class PPOTrainer(Trainer):
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     response = query_response[:, context_length:]
+                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     logprob = selective_log_softmax(logits, response)
                     del logits
                     torch.cuda.empty_cache()
@@ -530,12 +530,12 @@ class PPOTrainer(Trainer):
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(logprobs.shape[1], device=responses.device).repeat(responses.shape[0], 1)
+                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
                 sequence_lengths_p1 = sequence_lengths + 1
-                padding_mask_p1 = response_idxs > sequence_lengths_p1.unsqueeze(1)
+                padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
 
                 # 4. compute rewards
@@ -754,23 +754,18 @@ class PPOTrainer(Trainer):
                     if is_encoder_decoder:
                         # For encoder-decoder models, response is the entire generated sequence
                         response = query_response
-                        # Decode input separately to show in table
-                        table["query"].extend(
-                            gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
-                        )
                     else:
                         # For causal models, extract only the generated part
                         response = query_response[:, context_length:]
-                        table["query"].extend(
-                            gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
-                        )
                     
                     postprocessed_response = response
                     if self.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             self.stop_token_id, processing_class.pad_token_id, response
                         )
-                    
+                    table["query"].extend(
+                        gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
+                    )
                     table["model response"].extend(
                         gather_object(processing_class.batch_decode(postprocessed_response))
                     )
