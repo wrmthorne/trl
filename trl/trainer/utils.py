@@ -1198,7 +1198,6 @@ def get_reward(
     attention_mask = query_responses != pad_token_id
     
     if is_seq2seq_model(model):
-        query_responses = truncate_response(model.config.eos_token_id, pad_token_id, query_responses)
         # Seq2SeqForSequenceClassification forward pass performs logit handling for us
         # https://github.com/huggingface/transformers/blob/a42ba80fa520c784c8f11a973ca9034e5f859b79/src/transformers/models/t5/modeling_t5.py#L2135
         output = model(
@@ -1208,6 +1207,7 @@ def get_reward(
         )
         reward_logits = output.logits
         sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
+
         return (
             reward_logits.unsqueeze(-1),
             reward_logits.squeeze(-1),
@@ -1274,8 +1274,7 @@ def forward(
         encoder_attention_mask = attention_mask[:, :context_length]
         decoder_input_ids = input_ids[:, context_length:]
         decoder_attention_mask = attention_mask[:, context_length:]
-        
-        return model(
+        output = model(
             input_ids=encoder_input_ids,
             attention_mask=encoder_attention_mask,
             decoder_input_ids=decoder_input_ids,
@@ -1283,6 +1282,8 @@ def forward(
             return_dict=True,
             output_hidden_states=True,
         )
+        del encoder_input_ids, encoder_attention_mask, decoder_input_ids, decoder_attention_mask
+        return output
     else:
         position_ids = attention_mask.cumsum(1) - attention_mask.long()
         return model(

@@ -90,29 +90,14 @@ class PolicyAndValueWrapper(nn.Module):
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
         self.is_encoder_decoder = is_seq2seq_model(policy)
 
-    def forward(self, **kwargs):
-        output = None
-        
+    def forward(self, **kwargs):      
         if self.is_encoder_decoder:
-            # For encoder-decoder models, we need special handling
-            if "decoder_input_ids" in kwargs:
-                # Full encoder-decoder forward pass
-                output = self.critic_backbone(
-                    input_ids=kwargs["input_ids"],
-                    attention_mask=kwargs["attention_mask"],
-                    decoder_input_ids=kwargs["decoder_input_ids"],
-                    decoder_attention_mask=kwargs["decoder_attention_mask"],
-                    return_dict=True,
-                    output_hidden_states=True,
-                )
-                # For encoder-decoder models, we use the decoder's last hidden state
-                # and pass it through the value model's classification head
-                logits = self.value_model.classification_head(output.decoder_hidden_states[-1])
+            output = self.critic_backbone(**kwargs)
+            logits = self.value_model.classification_head(output.last_hidden_state)
         else:
             # Original causal model implementation
             output = self.critic_backbone(**kwargs)
-            logits = self.value_model.score(output.hidden_states[-1])
-            
+            logits = self.value_model.score(output.hidden_states[-1])  
         return self.policy(**kwargs), logits
 
 
