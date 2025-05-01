@@ -373,6 +373,8 @@ class PPOTrainer(Trainer):
             top_k=0.0,
             top_p=1.0,
             do_sample=True,
+            # Seq2Seq throws a fit if there are uneven eos tokens per sequence
+            forced_eos_token_id=self.stop_token_id if not is_encoder_decoder else None,
         )
 
         accelerator.print("===training policy===")
@@ -464,7 +466,7 @@ class PPOTrainer(Trainer):
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
                     postprocessed_response = response
-                    if self.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                    if self.stop_token_id is not None: # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             self.stop_token_id, processing_class.pad_token_id, response
                         )

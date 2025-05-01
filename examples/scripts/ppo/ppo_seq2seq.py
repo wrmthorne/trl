@@ -91,6 +91,11 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, padding_side="right", trust_remote_code=model_args.trust_remote_code
     )
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({"pad_token": "<pad>"})
+    if tokenizer.sep_token is None:
+        tokenizer.add_special_tokens({"sep_token": "<sep>"})
+
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
@@ -110,6 +115,8 @@ if __name__ == "__main__":
         )
     else:
         ref_policy = None
+
+    training_args.stop_token_id = tokenizer.eos_token_id
 
     ################
     # Dataset
