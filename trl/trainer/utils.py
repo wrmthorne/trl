@@ -1196,7 +1196,6 @@ def get_reward(
     # TODO: Add check for model.config.problem_type == "regression" if is_encoder_decoder
     # TODO: Properly test this method
     attention_mask = query_responses != pad_token_id
-    sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
     
     if is_seq2seq_model(model):
         query_responses = truncate_response(model.config.eos_token_id, pad_token_id, query_responses)
@@ -1208,6 +1207,7 @@ def get_reward(
             return_dict=True,
         )
         reward_logits = output.logits
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
         return (
             reward_logits.unsqueeze(-1),
             reward_logits.squeeze(-1),
@@ -1227,6 +1227,7 @@ def get_reward(
             use_cache=False,  # otherwise mistral-based RM would error out
         )
         reward_logits = model.score(output.hidden_states[-1])
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
         # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
         return (
             reward_logits,
