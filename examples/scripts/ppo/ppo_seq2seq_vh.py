@@ -32,6 +32,7 @@ from trl import (
     get_kbit_device_map,
     get_peft_config,
     get_quantization_config,
+    AutoModelForSeq2SeqLMWithValueHead,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 # from software_hut_logger import SoftwareHutLogger
@@ -100,23 +101,18 @@ if __name__ == "__main__":
 
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
-    value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1, problem_type="regression"
+    # value_model = AutoModelForSequenceClassification.from_pretrained(
+    #     training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1, problem_type="regression"
+    # )
+    # reward_model = AutoModelForSequenceClassification.from_pretrained(
+    #     training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1, problem_type="regression"
+    # )
+    policy = value_model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(
+        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, summary_dropout_prob=0.1, v_head_init_strategy="normal", v_head_initializer_range=0.1
     )
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1, problem_type="regression"
-    )
-    policy = AutoModelForSeq2SeqLM.from_pretrained(
+    ref_policy = reward_model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
-
-    peft_config = get_peft_config(model_args)
-    if peft_config is None:
-        ref_policy = AutoModelForSeq2SeqLM.from_pretrained(
-            training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
-        )
-    else:
-        ref_policy = None
 
     training_args.stop_token_id = tokenizer.eos_token_id
 
@@ -166,7 +162,7 @@ if __name__ == "__main__":
         value_model=value_model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        peft_config=peft_config,
+        # peft_config=peft_config,
         # callbacks=[shl_logger],
     )
     trainer.train()

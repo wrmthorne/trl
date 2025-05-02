@@ -1193,8 +1193,6 @@ def get_reward(
             - `sequence_lengths` (`torch.Tensor`):
                 The lengths of the sequences in the query responses.
     """
-    # TODO: Add check for model.config.problem_type == "regression" if is_encoder_decoder
-    # TODO: Properly test this method
     attention_mask = query_responses != pad_token_id
     
     if is_seq2seq_model(model):
@@ -1206,11 +1204,13 @@ def get_reward(
             return_dict=True,
         )
         reward_logits = output.logits
-        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) + context_length
         return (
-            reward_logits.unsqueeze(-1),
-            reward_logits.squeeze(-1),
+            reward_logits,
+            reward_logits[
+                torch.arange(reward_logits.size(0), device=reward_logits.device),
+                sequence_lengths,
+            ].squeeze(-1),
             sequence_lengths,
         )
     else:
@@ -1413,11 +1413,7 @@ def generate(
     )
     logits = torch.stack(output.scores, 1)
     if is_seq2seq_model(lm_backbone):
-        # Pad start align tokens and right shifted logits from teacher forcing
-        first_token_logits = torch.zeros(
-            (logits.shape[0], 1, logits.shape[2]), 
-            dtype=logits.dtype, device=logits.device)
-        return torch.cat((queries, output.sequences), dim=1), torch.cat((first_token_logits, logits), dim=1)
+        return torch.cat((queries, output.sequences), dim=1), logits
     else:
         return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
 

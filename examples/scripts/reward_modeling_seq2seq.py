@@ -62,6 +62,12 @@ from trl import (
     setup_chat_format,
 )
 
+from software_hut_logger import SoftwareHutLogger
+
+from trl.core import LengthSampler
+
+shl_logger = SoftwareHutLogger()
+
 
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, RewardConfig, ModelConfig))
@@ -92,8 +98,8 @@ if __name__ == "__main__":
     model.config.pad_token_id = tokenizer.pad_token_id
 
     # If post-training a base model, use ChatML as the default template
-    if tokenizer.chat_template is None:
-        model, tokenizer = setup_chat_format(model, tokenizer)
+    # if tokenizer.chat_template is None:
+    #     model, tokenizer = setup_chat_format(model, tokenizer)
 
     if model_args.use_peft and model_args.lora_task_type != "SEQ_CLS":
         warnings.warn(
@@ -117,6 +123,7 @@ if __name__ == "__main__":
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
+        callbacks=[shl_logger],
     )
     trainer.train()
 

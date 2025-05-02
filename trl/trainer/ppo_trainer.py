@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import gc
 import math
 import os
@@ -87,17 +88,17 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.value_model = value_model
-        self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
+        self.critic_backbone = getattr(value_model, "base_model_prefix")
         self.is_encoder_decoder = is_seq2seq_model(policy)
+        self.name_or_path = "google-t5/t5-small" # TODO: Remove this once demo data has been created
 
-    def forward(self, **kwargs):      
+    def forward(self, **kwargs):     
+        output = self.critic_backbone(**kwargs) 
         if self.is_encoder_decoder:
-            output = self.critic_backbone(**kwargs)
-            logits = self.value_model.classification_head(output.last_hidden_state)
+            logits = self.value_model.classification_head(output.hidden_states[-1])
+            logits = logits[:, 1:] # Drop the first padding token logit
         else:
-            # Original causal model implementation
-            output = self.critic_backbone(**kwargs)
-            logits = self.value_model.score(output.hidden_states[-1])  
+            logits = self.value_model.score(output.hidden_states[-1])
         return self.policy(**kwargs), logits
 
 
@@ -121,6 +122,7 @@ class PPOTrainer(Trainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
         peft_config: Optional["PeftConfig"] = None,
+        generation_config: Optional[GenerationConfig] = None,
     ) -> None:
         if ref_model is model:
             raise ValueError(
@@ -192,6 +194,25 @@ class PPOTrainer(Trainer):
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+
+        #########
+        # Generation config
+        #########
+        if generation_config is None:
+            # Load default generation config
+            self.generation_config = GenerationConfig(
+                max_new_tokens=args.response_length,
+                temperature=(args.temperature + 1e-7),
+                top_k=0.0,
+                top_p=1.0,
+                do_sample=True,
+                # Seq2Seq throws a fit if there are uneven eos tokens per sequence
+                forced_eos_token_id=self.stop_token_id if self.is_encoder_decoder else None,
+                eos_token_id=self.stop_token_id,
+                pad_token_id=self.processing_class.pad_token_id
+            )
+        else:
+            self.generation_config = generation_config
 
         #########
         # calculate various batch sizes
@@ -361,21 +382,13 @@ class PPOTrainer(Trainer):
         dataloader = self.dataloader
         device = accelerator.device
         is_encoder_decoder = self.is_encoder_decoder
+        generation_config = self.generation_config
 
         def repeat_generator():
             while True:
                 yield from dataloader
 
         iter_dataloader = iter(repeat_generator())
-        generation_config = GenerationConfig(
-            max_new_tokens=args.response_length,
-            temperature=(args.temperature + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-            # Seq2Seq throws a fit if there are uneven eos tokens per sequence
-            forced_eos_token_id=self.stop_token_id if not is_encoder_decoder else None,
-        )
 
         accelerator.print("===training policy===")
         start_time = time.time()
@@ -446,6 +459,9 @@ class PPOTrainer(Trainer):
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    if is_encoder_decoder:
+                        response = response[:, 1:] # Drop the first padding token
+                    logits /= args.temperature + 1e-7 # Missing temp scaling - intentional?
                     logprob = selective_log_softmax(logits, response)
                     del logits
                     torch.cuda.empty_cache()
@@ -456,7 +472,8 @@ class PPOTrainer(Trainer):
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id, context_length)
                     if is_encoder_decoder:
-                        ref_logits = ref_output.logits
+                        # drop the first dummy decoder logit to align with policy logits/response
+                        ref_logits = ref_output.logits[:, 1:, :]
                     else:
                         ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
@@ -474,8 +491,8 @@ class PPOTrainer(Trainer):
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     if is_encoder_decoder:
-                        # Skip first token (decoder_start_token_id usually same as pad_token_id) or len always -1
-                        sequence_length = first_true_indices(postprocessed_response[:, 1:] == processing_class.pad_token_id)
+                        # No -1 as we dropped the first pad decoder logit used to start generation
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id)
                     else:
                         sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
@@ -483,7 +500,9 @@ class PPOTrainer(Trainer):
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     if is_encoder_decoder:
-                        value = full_value.squeeze(-1)
+                        # Take the response portion (after context) and drop the first dummy decoder step
+                        response_values = full_value[:, context_length:]
+                        value = response_values[:, 1:]
                     else:
                         value = full_value[:, context_length - 1 : -1].squeeze(-1)
                     _, score, _ = get_reward(
@@ -497,11 +516,6 @@ class PPOTrainer(Trainer):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
-                    values.append(value)
-                responses = torch.cat(responses, 0)
-                postprocessed_responses = torch.cat(postprocessed_responses, 0)
-                logprobs = torch.cat(logprobs, 0)
-                ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
@@ -576,7 +590,7 @@ class PPOTrainer(Trainer):
 
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id, context_length)
                             if is_encoder_decoder:
-                                logits = output.logits
+                                logits = output.logits[:, 1:, :]
                             else:
                                 logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
@@ -585,7 +599,7 @@ class PPOTrainer(Trainer):
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
                             if is_encoder_decoder:
-                                vpred = vpred_temp.squeeze(-1)
+                                vpred = vpred_temp[:, 1:].squeeze(-1)
                             else:
                                 vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
@@ -714,13 +728,10 @@ class PPOTrainer(Trainer):
         args = self.args
         processing_class = self.processing_class
         is_encoder_decoder = self.is_encoder_decoder
-        generation_config = GenerationConfig(
-            max_new_tokens=self.args.response_length,
-            temperature=(0.01 + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-        )
+        generation_config = copy.deepcopy(self.generation_config)
+        generation_config.do_sample = sampling
+        if sampling:
+            generation_config.top_k = None
 
         table = defaultdict(list)
         with unwrap_model_for_generation(

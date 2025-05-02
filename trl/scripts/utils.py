@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import yaml
-from transformers import HfArgumentParser
+from transformers import HfArgumentParser, GenerationConfig
 from transformers.hf_argparser import DataClass, DataClassType
 
 
@@ -73,6 +73,19 @@ class ScriptArguments:
             "https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992."
         },
     )
+    generation_config_yaml: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a YAML file containing generation configuration options."
+        },
+    )
+
+
+    def __post_init__(self):
+        if self.generation_config_yaml is not None:
+            with open(self.generation_config_yaml) as f:
+                generation_config = yaml.safe_load(f)
+            self.generation_config = GenerationConfig(**generation_config)
 
 
 def init_zero_verbose():
