@@ -527,7 +527,15 @@ class PPOTrainer(Trainer):
                 logr = ref_logprobs - logprobs
                 kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr  # Else statement is k3
                 non_score_reward = -args.kl_coef * kl
-                rewards = non_score_reward.clone()
+                if self.is_encoder_decoder:
+                    # Easiest and least impactful way to bring seq2seq inline with causal's existing code
+                    # Add "pad" column to the end to align shapes and slice it off when necessary
+                    # TODO: Come up with better solution
+                    batch_size, seq_len = non_score_reward.shape
+                    spare = torch.zeros(batch_size, 1, device=non_score_reward.device)
+                    rewards = torch.cat((non_score_reward, spare), 1)
+                else:
+                    rewards = non_score_reward.clone()
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
                 rewards[[actual_start, actual_end]] += scores
