@@ -452,7 +452,7 @@ class PPOTrainer(Trainer):
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id, context_length)
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id, context_length)
-                    if is_encoder_decoder(model.policy):
+                    if self.is_encoder_decoder:
                         ref_logits = ref_output.logits
                     else:
                         ref_logits = ref_output.logits[:, context_length - 1 : -1]
@@ -470,7 +470,7 @@ class PPOTrainer(Trainer):
 
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    if is_encoder_decoder:
+                    if self.is_encoder_decoder:
                         # No -1 as we dropped the first pad decoder logit used to start generation
                         sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id)
                     else:
@@ -479,14 +479,13 @@ class PPOTrainer(Trainer):
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    if is_encoder_decoder:
-                        response_value = full_value[:, context_length:] # Split response then remove pad
-                        value = response_value[:, 1:].squeeze(-1) # TODO: This squeeze might cause problems
+                    if self.is_encoder_decoder:
+                        # Full value from seq2seq is actually only responses
+                        value = full_value.squeeze(-1)
                     else:
                         value = full_value[:, context_length - 1 : -1].squeeze(-1)
                     _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id,
-                        0 if is_encoder_decoder else context_length  # TODO: validate this - For encoder-decoder, the context is the entire input
+                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                     )
 
                     responses.append(response)
@@ -503,7 +502,7 @@ class PPOTrainer(Trainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
-                del (logprob, ref_logprob, full_value, response_value, value, score, unwrapped_model)
+                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 torch.cuda.empty_cache()
                 gc.collect()
 

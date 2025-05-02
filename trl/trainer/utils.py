@@ -1216,8 +1216,6 @@ def get_reward(
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     model_inputs = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
         "return_dict": True,
         "output_hidden_states": True,
         "use_cache": False,  # otherwise mistral-based RM would error out
@@ -1229,28 +1227,32 @@ def get_reward(
         model_inputs["decoder_input_ids"] = input_ids[:, context_length:]
         model_inputs["decoder_attention_mask"] = attention_mask[:, context_length:]
         output = lm_backbone(**model_inputs)
-        # classification_head returns (batch, resp_len)
         reward_logits = model.classification_head(output.last_hidden_state)
         # sequence_lengths is index of first padding in response
-        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id)
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1
+        return (
+            reward_logits,
+            reward_logits[ # Final logits don't necessarily line up so we use seq lens
+                torch.arange(reward_logits.size(0), device=reward_logits.device),
+                sequence_lengths,
+            ].squeeze(-1),
+            sequence_lengths,
+        )
     else:
-        # Causal: run full forward and then drop the prompt portion of the logits
+        model_inputs["input_ids"] = input_ids
+        model_inputs["attention_mask"] = attention_mask
         model_inputs["position_ids"] = position_ids
         output = lm_backbone(**model_inputs)
-        full_logits = model.score(output.hidden_states[-1])  # shape (batch, query+resp)
-        # slice off the prompt, keep only response logits
-        reward_logits = full_logits[:, context_length:]
-        # sequence_lengths relative to response, subtract 1 to point at last real token
-        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1
-    # Return per-step logits, final reward and lengths in the response space
-    return (
-        reward_logits,
-        reward_logits[
-            torch.arange(reward_logits.size(0), device=reward_logits.device),
+        reward_logits = model.score(output.hidden_states[-1])
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
+        return (
+            reward_logits,
+            reward_logits[
+                torch.arange(reward_logits.size(0), device=reward_logits.device),
+                sequence_lengths,
+            ].squeeze(-1),
             sequence_lengths,
-        ].squeeze(-1),
-        sequence_lengths,
-    )
+        )
 
 
 # TODO: Come back and implement custom forward pass for encoder-decoder models
