@@ -1179,6 +1179,13 @@ def first_true_indices(bools: torch.Tensor, dtype=torch.long):
     return torch.min(zero_or_index, dim=-1).values
 
 
+def is_encoder_decoder(model):
+    """Check if a model is a Seq2Seq model (encoder-decoder architecture)."""
+    if hasattr(model, "config"):
+        return getattr(model.config, "is_encoder_decoder", False)
+    return hasattr(model, "encoder") and hasattr(model, "decoder")
+
+
 def get_reward(
     model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1208,17 +1215,34 @@ def get_reward(
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    output = lm_backbone(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-        use_cache=False,  # otherwise mistral-based RM would error out
-    )
-    reward_logits = model.score(output.hidden_states[-1])
-    sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
+    model_inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "return_dict": True,
+        "output_hidden_states": True,
+        "use_cache": False,  # otherwise mistral-based RM would error out
+    }
+    if is_encoder_decoder(lm_backbone):
+        # Seq2Seq: pass encoder/decoder inputs and get per-step logits only for the response
+        model_inputs["input_ids"] = input_ids[:, :context_length]
+        model_inputs["attention_mask"] = attention_mask[:, :context_length]
+        model_inputs["decoder_input_ids"] = input_ids[:, context_length:]
+        model_inputs["decoder_attention_mask"] = attention_mask[:, context_length:]
+        output = lm_backbone(**model_inputs)
+        # classification_head returns (batch, resp_len)
+        reward_logits = model.classification_head(output.last_hidden_state)
+        # sequence_lengths is index of first padding in response
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id)
+    else:
+        # Causal: run full forward and then drop the prompt portion of the logits
+        model_inputs["position_ids"] = position_ids
+        output = lm_backbone(**model_inputs)
+        full_logits = model.score(output.hidden_states[-1])  # shape (batch, query+resp)
+        # slice off the prompt, keep only response logits
+        reward_logits = full_logits[:, context_length:]
+        # sequence_lengths relative to response, subtract 1 to point at last real token
+        sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1
+    # Return per-step logits, final reward and lengths in the response space
     return (
         reward_logits,
         reward_logits[
@@ -1229,10 +1253,12 @@ def get_reward(
     )
 
 
+# TODO: Come back and implement custom forward pass for encoder-decoder models
 def forward(
     model: torch.nn.Module,
     query_responses: torch.Tensor,
     pad_token_id: int,
+    context_length: Optional[int] = None,
 ) -> torch.nn.Module:
     """
     Performs a forward pass through the model with the given query responses and pad token ID.
@@ -1244,18 +1270,40 @@ def forward(
             The tensor containing the query responses.
         pad_token_id (`int`):
             The token ID representing the pad token.
+        context_length (`int`, optional):
+            The length of the context in the query responses.
 
     Returns:
         `torch.nn.Module`:
             The output of the model, including hidden states.
     """
     attention_mask = query_responses != pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    if is_encoder_decoder(model):
+        # For encoder-decoder, use `labels` to let HF shift tokens internally
+        enc_input_ids = input_ids[:, :context_length]
+        enc_attention_mask = attention_mask[:, :context_length]
+        # The generated tokens (no BOS pad) become labels
+        dec_labels = input_ids[:, context_length:].clone()
+        dec_labels[dec_labels == pad_token_id] = -100
+        dec_attention_mask = attention_mask[:, context_length:]
+        return model(
+            input_ids=enc_input_ids,
+            attention_mask=enc_attention_mask,
+            labels=dec_labels,
+            decoder_attention_mask=dec_attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+        )
+    else:
+        position_ids = attention_mask.cumsum(1) - attention_mask.long()
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
     return model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
+        **model_inputs,
         return_dict=True,
         output_hidden_states=True,
     )
@@ -1374,7 +1422,10 @@ def generate(
         output_scores=True,
     )
     logits = torch.stack(output.scores, 1)
-    return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
+    if is_encoder_decoder(lm_backbone):
+        return torch.cat((queries, output.sequences[:, 1:]), dim=1), logits
+    else:
+        return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
 
 
 @torch.no_grad()

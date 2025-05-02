@@ -60,6 +60,7 @@ from .utils import (
     generate_model_card,
     get_comet_experiment_url,
     get_reward,
+    is_encoder_decoder,
     log_table_to_comet_experiment,
     peft_module_casting_to_bf16,
     prepare_deepspeed,
@@ -86,11 +87,16 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.value_model = value_model
-        self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
+        self.critic_backbone = getattr(value_model, "base_model_prefix")
+        self.is_encoder_decoder = is_encoder_decoder(policy)
 
-    def forward(self, **kwargs):
-        output = self.critic_backbone(**kwargs)
-        logits = self.value_model.score(output.hidden_states[-1])
+    def forward(self, **kwargs):     
+        output = self.critic_backbone(**kwargs) 
+        if self.is_encoder_decoder:
+            logits = self.value_model.classification_head(output.hidden_states[-1])
+            logits = logits[:, 1:] # Drop the first padding token logit
+        else:
+            logits = self.value_model.score(output.hidden_states[-1])
         return self.policy(**kwargs), logits
 
 
@@ -124,6 +130,7 @@ class PPOTrainer(Trainer):
         self.args = args
         self.processing_class = processing_class
         self.policy_model = model
+        self.is_encoder_decoder = is_encoder_decoder(model)
 
         # Define the collator if not provided
         if data_collator is None:
@@ -435,16 +442,20 @@ class PPOTrainer(Trainer):
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    logits /= args.temperature + 1e-7 # Missing temp scaling - intentional?
                     logprob = selective_log_softmax(logits, response)
                     del logits
                     torch.cuda.empty_cache()
 
                     if ref_policy is None:
                         with self.null_ref_context():
-                            ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
+                            ref_output = forward(model.policy, query_response, processing_class.pad_token_id, context_length)
                     else:
-                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
-                    ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id, context_length)
+                    if is_encoder_decoder(model.policy):
+                        ref_logits = ref_output.logits
+                    else:
+                        ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_logprob = selective_log_softmax(ref_logits, response)
                     del ref_output, ref_logits
@@ -459,14 +470,23 @@ class PPOTrainer(Trainer):
 
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    if is_encoder_decoder:
+                        # No -1 as we dropped the first pad decoder logit used to start generation
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id)
+                    else:
+                        sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    if is_encoder_decoder:
+                        response_value = full_value[:, context_length:] # Split response then remove pad
+                        value = response_value[:, 1:].squeeze(-1) # TODO: This squeeze might cause problems
+                    else:
+                        value = full_value[:, context_length - 1 : -1].squeeze(-1)
                     _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        reward_model, postprocessed_query_response, processing_class.pad_token_id,
+                        0 if is_encoder_decoder else context_length  # TODO: validate this - For encoder-decoder, the context is the entire input
                     )
 
                     responses.append(response)
@@ -483,7 +503,7 @@ class PPOTrainer(Trainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
-                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
+                del (logprob, ref_logprob, full_value, response_value, value, score, unwrapped_model)
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -552,7 +572,7 @@ class PPOTrainer(Trainer):
                             mb_return = returns[micro_batch_inds]
                             mb_values = values[micro_batch_inds]
 
-                            output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
+                            output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id, context_length)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_logprobs = selective_log_softmax(logits, mb_responses)
