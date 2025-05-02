@@ -1282,17 +1282,28 @@ def forward(
     attention_mask = query_responses != pad_token_id
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     if is_encoder_decoder(model):
-        # For encoder-decoder, use `labels` to let HF shift tokens internally
+        # Seq2Seq: build explicit decoder_input_ids (no raw labels) to feed both policy & critic
         enc_input_ids = input_ids[:, :context_length]
         enc_attention_mask = attention_mask[:, :context_length]
-        # The generated tokens (no BOS pad) become labels
-        dec_labels = input_ids[:, context_length:].clone()
-        dec_labels[dec_labels == pad_token_id] = -100
-        dec_attention_mask = attention_mask[:, context_length:]
+        # Responses become decoder inputs
+        resp_ids   = input_ids[:, context_length:]           # [batch, resp_len]
+        resp_mask  = attention_mask[:, context_length:]      # [batch, resp_len]
+        batch, rl  = resp_ids.shape
+        # May be useful to cache this as the batch size is mostly consistent and models are fixed for training
+        start_tok  = torch.full(
+            (batch, 1), 
+            model.config.decoder_start_token_id,
+            dtype=resp_ids.dtype,
+            device=resp_ids.device
+        )
+        # drop last token of the response and prepend the start token
+        dec_input_ids = torch.cat([start_tok, resp_ids[:, :-1]], dim=1)  # [batch, resp_len]
+        dec_attention_mask = resp_mask
+
         return model(
             input_ids=enc_input_ids,
             attention_mask=enc_attention_mask,
-            labels=dec_labels,
+            decoder_input_ids=dec_input_ids,
             decoder_attention_mask=dec_attention_mask,
             return_dict=True,
             output_hidden_states=True,

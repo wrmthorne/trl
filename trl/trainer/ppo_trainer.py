@@ -87,13 +87,13 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.value_model = value_model
-        self.critic_backbone = getattr(value_model, "base_model_prefix")
+        self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
         self.is_encoder_decoder = is_encoder_decoder(policy)
 
-    def forward(self, **kwargs):     
-        output = self.critic_backbone(**kwargs) 
+    def forward(self, **kwargs):
+        output = self.critic_backbone(**kwargs)
         if self.is_encoder_decoder:
-            logits = self.value_model.classification_head(output.hidden_states[-1])
+            logits = self.value_model.classification_head(output.last_hidden_state)
             logits = logits[:, 1:] # Drop the first padding token logit
         else:
             logits = self.value_model.score(output.hidden_states[-1])
@@ -580,25 +580,43 @@ class PPOTrainer(Trainer):
                             mb_values = values[micro_batch_inds]
 
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id, context_length)
-                            logits = output.logits[:, context_length - 1 : -1]
+                            if self.is_encoder_decoder:
+                                logits = output.logits
+                            else:
+                                logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_logprobs = selective_log_softmax(logits, mb_responses)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
-                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                            vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
+                            if self.is_encoder_decoder:
+                                # seq2seq: vpred_temp was shifted so we dropped the first token,
+                                # giving vpred of length resp_len-1.  Slice off the last mask col.
+                                vpred = vpred_temp.squeeze(-1)
+                                seq_mask_p1 = padding_mask_p1[micro_batch_inds][:, :-1]
+                                vpred = torch.masked_fill(vpred, seq_mask_p1, 0)
+                                mask_not_p1 = ~seq_mask_p1
+                                # also slice off the last column of values & returns so they match vpred
+                                mb_values_seq = mb_values[:, :-1]
+                                mb_return_seq = mb_return[:, :-1]
+                            else:
+                                vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                                vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
+                                mask_not_p1 = ~padding_mask_p1[micro_batch_inds]
+                                mb_values_seq = mb_values
+                                mb_return_seq = mb_return
                             vpredclipped = torch.clamp(
                                 vpred,
-                                mb_values - args.cliprange_value,
-                                mb_values + args.cliprange_value,
+                                mb_values_seq - args.cliprange_value,
+                                mb_values_seq + args.cliprange_value,
                             )
-                            vf_losses1 = torch.square(vpred - mb_return)
-                            vf_losses2 = torch.square(vpredclipped - mb_return)
+                            vf_losses1 = torch.square(vpred - mb_return_seq)
+                            vf_losses2 = torch.square(vpredclipped - mb_return_seq)
                             vf_loss_max = torch.max(vf_losses1, vf_losses2)
-                            vf_loss = 0.5 * masked_mean(vf_loss_max, ~padding_mask_p1[micro_batch_inds])
+                            vf_loss = 0.5 * masked_mean(vf_loss_max, mask_not_p1)
                             vf_clipfrac = masked_mean(
-                                (vf_losses2 > vf_losses1).float(), ~padding_mask_p1[micro_batch_inds]
+                                (vf_losses2 > vf_losses1).float(),
+                                mask_not_p1,
                             )
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
